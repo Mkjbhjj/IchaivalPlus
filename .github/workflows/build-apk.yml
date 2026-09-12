@@ -30,6 +30,9 @@ jobs:
           mv MainActivity.kt app/src/main/java/com/ichaival/plus/
         fi
 
+        echo "android.useAndroidX=true" > gradle.properties
+        echo "android.nonTransitiveRClass=true" >> gradle.properties
+
         cat << 'EOF' > settings.gradle.kts
         pluginManagement {
             repositories {
