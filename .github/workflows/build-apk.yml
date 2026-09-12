@@ -32,6 +32,7 @@ jobs:
 
         echo "android.useAndroidX=true" > gradle.properties
         echo "android.nonTransitiveRClass=true" >> gradle.properties
+        echo "org.gradle.jvmargs=-Xmx3072m -XX:MaxMetaspaceSize=1024m" >> gradle.properties
 
         cat << 'EOF' > settings.gradle.kts
         pluginManagement {
@@ -135,9 +136,11 @@ jobs:
 
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v3
+      with:
+        gradle-version: 8.5
 
     - name: Build Debug APK
-      run: gradle :app:assembleDebug
+      run: gradle :app:assembleDebug --no-daemon
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
