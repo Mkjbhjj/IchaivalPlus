@@ -1,7 +1,7 @@
 package com.ichaival.plus
 
+import android.content.Context
 import android.os.Bundle
-import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -21,17 +21,20 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import coil.ImageLoader
 import coil.compose.AsyncImage
+import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLEncoder
+import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -48,72 +51,106 @@ class MainActivity : ComponentActivity() {
 
 data class ArchiveItem(val id: String, val title: String, val pageCount: Int, var progress: Int = 0)
 
+// 全局带 CookieJar 的 OkHttpClient，行为与浏览器网络栈完全一致
+class CookieManager {
+    private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
+
+    val client: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .cookieJar(object : CookieJar {
+                override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
+                    cookieStore[url.host] = cookies.toMutableList()
+                }
+
+                override fun loadForRequest(url: HttpUrl): List<Cookie> {
+                    return cookieStore[url.host] ?: emptyList()
+                }
+            })
+            .build()
+    }
+}
+
+val globalCookieManager = CookieManager()
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AppRoot() {
     val context = LocalContext.current
-    var serverUrl by remember { mutableStateOf("http://192.168.1.100:3000") }
-    var passwordInput by remember { mutableStateOf("") }
+    val sharedPref = remember { context.getSharedPreferences("ichaival_prefs", Context.MODE_PRIVATE) }
+
+    var serverUrl by remember { mutableStateOf(sharedPref.getString("url", "http://192.168.1.100:3000") ?: "") }
+    var passwordInput by remember { mutableStateOf(sharedPref.getString("pwd", "") ?: "") }
     var archives by remember { mutableStateOf<List<ArchiveItem>>(emptyList()) }
     var currentArchive by remember { mutableStateOf<ArchiveItem?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
-    val client = remember { OkHttpClient() }
+    val client = globalCookieManager.client
 
-    // 将用户输入的网页密码转换为 LANraragi 规范的 Base64 Bearer Token
-    fun getAuthBearer(): String {
-        if (passwordInput.isBlank()) return ""
-        val trimmed = passwordInput.trim()
-        val base64Key = Base64.encodeToString(trimmed.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
-        return "Bearer $base64Key"
+    // 配置专属于此 OkHttpClient 的图片加载器
+    val imageLoader = remember {
+        ImageLoader.Builder(context)
+            .okHttpClient(client)
+            .build()
     }
 
-    // 自动同步阅读进度回 LANraragi
+    // 网页端进度上报接口
     fun syncProgress(archiveId: String, page: Int) {
         scope.launch(Dispatchers.IO) {
             try {
                 val cleanUrl = serverUrl.trimEnd('/')
-                val reqBuilder = Request.Builder()
+                val req = Request.Builder()
                     .url("$cleanUrl/api/archives/$archiveId/progress/$page")
                     .put("".toRequestBody("application/json".toMediaType()))
-                val auth = getAuthBearer()
-                if (auth.isNotBlank()) reqBuilder.header("Authorization", auth)
-                client.newCall(reqBuilder.build()).execute().close()
+                    .build()
+                client.newCall(req).execute().close()
             } catch (_: Exception) {}
         }
     }
 
-    // 获取书架归档列表
-    fun loadArchives() {
+    // 像网页一样先走表单登录获取 Session Cookie，随后拉取画廊列表
+    fun loginAndLoad() {
         scope.launch(Dispatchers.IO) {
             try {
                 val cleanUrl = serverUrl.trimEnd('/')
-                val reqBuilder = Request.Builder().url("$cleanUrl/api/archives").get()
-                val auth = getAuthBearer()
-                if (auth.isNotBlank()) reqBuilder.header("Authorization", auth)
                 
-                val resp = client.newCall(reqBuilder.build()).execute()
-                val respBody = resp.body?.string() ?: ""
+                // 1. 如果填了密码，先向 /login 发起表单登录
+                if (passwordInput.isNotBlank()) {
+                    val formBody = FormBody.Builder()
+                        .add("password", passwordInput.trim())
+                        .build()
+                    val loginReq = Request.Builder()
+                        .url("$cleanUrl/login")
+                        .post(formBody)
+                        .build()
+                    client.newCall(loginReq).execute().close()
+                }
+
+                // 2. 带上 Cookie 请求归档列表
+                val req = Request.Builder().url("$cleanUrl/api/archives").get().build()
+                val resp = client.newCall(req).execute()
+                val body = resp.body?.string() ?: ""
 
                 if (!resp.isSuccessful) {
                     withContext(Dispatchers.Main) {
-                        errorMessage = "服务器返回错误: ${resp.code} $respBody"
+                        errorMessage = "连接失败，HTTP 错误码: ${resp.code}"
                     }
                     return@launch
                 }
 
-                if (respBody.startsWith("{")) {
-                    val jsonObj = JSONObject(respBody)
+                if (body.startsWith("{")) {
+                    val jsonObj = JSONObject(body)
                     if (jsonObj.has("error")) {
                         withContext(Dispatchers.Main) {
-                            errorMessage = "登录错误: ${jsonObj.getString("error")}\n请检查密码是否正确。"
+                            errorMessage = "认证失败: ${jsonObj.getString("error")}"
                         }
                         return@launch
                     }
                 }
 
-                val jsonArray = JSONArray(respBody)
+                val jsonArray = JSONArray(body)
                 val list = mutableListOf<ArchiveItem>()
                 for (i in 0 until jsonArray.length()) {
                     val obj = jsonArray.getJSONObject(i)
@@ -126,13 +163,16 @@ fun AppRoot() {
                         )
                     )
                 }
+
                 withContext(Dispatchers.Main) {
                     archives = list
                     errorMessage = null
+                    // 保存配置
+                    sharedPref.edit().putString("url", serverUrl).putString("pwd", passwordInput).apply()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    errorMessage = "连接失败: ${e.localizedMessage}"
+                    errorMessage = "网络连接异常: ${e.localizedMessage}"
                 }
             }
         }
@@ -142,8 +182,8 @@ fun AppRoot() {
         ReaderScreen(
             serverUrl = serverUrl,
             archive = currentArchive!!,
-            authBearer = getAuthBearer(),
             client = client,
+            imageLoader = imageLoader,
             onProgressChange = { p ->
                 currentArchive?.progress = p
                 syncProgress(currentArchive!!.id, p)
@@ -156,7 +196,7 @@ fun AppRoot() {
                 TopAppBar(
                     title = { Text("Ichaival+ (LANraragi)") },
                     actions = {
-                        IconButton(onClick = { loadArchives() }) {
+                        IconButton(onClick = { loginAndLoad() }) {
                             Icon(Icons.Default.Refresh, contentDescription = "刷新")
                         }
                         IconButton(onClick = { showSettings = true }) {
@@ -174,20 +214,16 @@ fun AppRoot() {
                     ) {
                         Text(text = errorMessage!!, color = MaterialTheme.colorScheme.error)
                         Spacer(modifier = Modifier.height(12.dp))
-                        Button(onClick = { showSettings = true }) {
-                            Text("重新配置连接")
-                        }
+                        Button(onClick = { showSettings = true }) { Text("修改服务器地址与密码") }
                     }
                 } else if (archives.isEmpty()) {
                     Column(
                         modifier = Modifier.align(Alignment.Center),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text("点击右上角设置配置服务器地址与密码")
+                        Text("尚未获取到书架内容")
                         Spacer(modifier = Modifier.height(8.dp))
-                        Button(onClick = { showSettings = true }) {
-                            Text("配置连接")
-                        }
+                        Button(onClick = { showSettings = true }) { Text("配置连接") }
                     }
                 } else {
                     LazyVerticalGrid(
@@ -205,18 +241,11 @@ fun AppRoot() {
                             ) {
                                 Column {
                                     val cleanUrl = serverUrl.trimEnd('/')
-                                    val auth = getAuthBearer()
-
-                                    val imageRequest = ImageRequest.Builder(context)
-                                        .data("$cleanUrl/api/archives/${arc.id}/thumbnail")
-                                        .apply {
-                                            if (auth.isNotBlank()) addHeader("Authorization", auth)
-                                        }
-                                        .crossfade(true)
-                                        .build()
+                                    val thumbUrl = "$cleanUrl/api/archives/${arc.id}/thumbnail"
 
                                     AsyncImage(
-                                        model = imageRequest,
+                                        model = ImageRequest.Builder(context).data(thumbUrl).crossfade(true).build(),
+                                        imageLoader = imageLoader,
                                         contentDescription = arc.title,
                                         modifier = Modifier.height(200.dp).fillMaxWidth(),
                                         contentScale = ContentScale.Crop
@@ -228,7 +257,7 @@ fun AppRoot() {
                                         modifier = Modifier.padding(8.dp)
                                     )
                                     Text(
-                                        text = "进度: ${arc.progress}/${arc.pageCount}P",
+                                        text = "阅读进度: ${arc.progress}/${arc.pageCount}P",
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.primary,
                                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -244,14 +273,13 @@ fun AppRoot() {
         if (showSettings) {
             AlertDialog(
                 onDismissRequest = { showSettings = false },
-                title = { Text("LANraragi 服务端配置") },
+                title = { Text("LANraragi 网页登录设置") },
                 text = {
                     Column {
                         OutlinedTextField(
                             value = serverUrl,
                             onValueChange = { serverUrl = it },
-                            label = { Text("服务器地址 (包含端口)") },
-                            placeholder = { Text("http://192.168.1.x:3000") },
+                            label = { Text("服务器地址 (含端口)") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -259,8 +287,8 @@ fun AppRoot() {
                         OutlinedTextField(
                             value = passwordInput,
                             onValueChange = { passwordInput = it },
-                            label = { Text("网页登录密码 (或 API Key)") },
-                            placeholder = { Text("输入 114514") },
+                            label = { Text("网页端密码") },
+                            placeholder = { Text("例如 114514") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -269,15 +297,11 @@ fun AppRoot() {
                 confirmButton = {
                     Button(onClick = {
                         showSettings = false
-                        loadArchives()
-                    }) {
-                        Text("保存并连接")
-                    }
+                        loginAndLoad()
+                    }) { Text("像网页端一样登录") }
                 },
                 dismissButton = {
-                    TextButton(onClick = { showSettings = false }) {
-                        Text("取消")
-                    }
+                    TextButton(onClick = { showSettings = false }) { Text("取消") }
                 }
             )
         }
@@ -289,51 +313,58 @@ fun AppRoot() {
 fun ReaderScreen(
     serverUrl: String,
     archive: ArchiveItem,
-    authBearer: String,
     client: OkHttpClient,
+    imageLoader: ImageLoader,
     onProgressChange: (Int) -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
-    var currentPage by remember { mutableStateOf(if (archive.progress > 0) archive.progress else 1) }
-    var isExtracting by remember { mutableStateOf(true) }
-    var extractError by remember { mutableStateOf<String?>(null) }
+    var pages by remember { mutableStateOf<List<String>>(emptyList()) }
+    var currentIndex by remember { mutableStateOf(if (archive.progress > 0) (archive.progress - 1).coerceAtLeast(0) else 0) }
+    var isLoadingFiles by remember { mutableStateOf(true) }
+    var loadError by remember { mutableStateOf<String?>(null) }
     val cleanUrl = serverUrl.trimEnd('/')
 
-    // 进入阅读器时，先通知服务端解压归档文件缓存
+    // 复刻网页端 reader.js：进入阅读器先通过 /api/archives/{id}/files 获取实际图片路径数组
     LaunchedEffect(archive.id) {
         withContext(Dispatchers.IO) {
             try {
-                val reqBuilder = Request.Builder()
-                    .url("$cleanUrl/api/archives/${archive.id}/extract")
-                    .post("".toRequestBody("application/json".toMediaType()))
-                if (authBearer.isNotBlank()) reqBuilder.header("Authorization", authBearer)
+                val req = Request.Builder().url("$cleanUrl/api/archives/${archive.id}/files").get().build()
+                val resp = client.newCall(req).execute()
+                val body = resp.body?.string() ?: ""
 
-                val resp = client.newCall(reqBuilder.build()).execute()
                 if (resp.isSuccessful) {
+                    val jsonObj = JSONObject(body)
+                    val pagesJson = jsonObj.getJSONArray("pages")
+                    val pageList = mutableListOf<String>()
+                    for (i in 0 until pagesJson.length()) {
+                        pageList.add(pagesJson.getString(i))
+                    }
                     withContext(Dispatchers.Main) {
-                        isExtracting = false
+                        pages = pageList
+                        isLoadingFiles = false
                     }
                 } else {
                     withContext(Dispatchers.Main) {
-                        extractError = "服务端预解压失败 (${resp.code})"
-                        isExtracting = false
+                        loadError = "获取页面清单失败 (${resp.code})"
+                        isLoadingFiles = false
                     }
                 }
-                resp.close()
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    extractError = "连接解压接口失败: ${e.localizedMessage}"
-                    isExtracting = false
+                    loadError = "加载异常: ${e.localizedMessage}"
+                    isLoadingFiles = false
                 }
             }
         }
     }
 
+    val totalCount = if (pages.isNotEmpty()) pages.size else archive.pageCount
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("${archive.title} ($currentPage/${archive.pageCount})") },
+                title = { Text("${archive.title} (${currentIndex + 1}/$totalCount)") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
@@ -349,20 +380,20 @@ fun ReaderScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Button(
-                        enabled = currentPage > 1 && !isExtracting,
+                        enabled = currentIndex > 0 && !isLoadingFiles,
                         onClick = {
-                            currentPage--
-                            onProgressChange(currentPage)
+                            currentIndex--
+                            onProgressChange(currentIndex + 1)
                         }
                     ) { Text("上一页") }
 
-                    Text("$currentPage / ${archive.pageCount}")
+                    Text("${currentIndex + 1} / $totalCount")
 
                     Button(
-                        enabled = currentPage < archive.pageCount && !isExtracting,
+                        enabled = currentIndex < totalCount - 1 && !isLoadingFiles,
                         onClick = {
-                            currentPage++
-                            onProgressChange(currentPage)
+                            currentIndex++
+                            onProgressChange(currentIndex + 1)
                         }
                     ) { Text("下一页") }
                 }
@@ -376,28 +407,36 @@ fun ReaderScreen(
                 .background(Color.Black),
             contentAlignment = Alignment.Center
         ) {
-            if (isExtracting) {
+            if (isLoadingFiles) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                     Spacer(modifier = Modifier.height(12.dp))
-                    Text("正在向服务器请求解压归档缓存...", color = Color.White)
+                    Text("正在载入漫画页面清单...", color = Color.White)
                 }
-            } else if (extractError != null) {
-                Text(text = extractError!!, color = MaterialTheme.colorScheme.error)
-            } else {
-                val imageRequest = ImageRequest.Builder(context)
-                    .data("$cleanUrl/api/archives/${archive.id}/page?page=$currentPage")
-                    .apply {
-                        if (authBearer.isNotBlank()) addHeader("Authorization", authBearer)
-                    }
-                    .crossfade(true)
-                    .build()
+            } else if (loadError != null) {
+                Text(text = loadError!!, color = MaterialTheme.colorScheme.error)
+            } else if (pages.isNotEmpty()) {
+                // 使用解压后的真实相对路径拼接图片 URL（网页端同款机制）
+                val currentPath = pages[currentIndex]
+                val encodedPath = URLEncoder.encode(currentPath, "UTF-8")
+                val imgUrl = "$cleanUrl/api/archives/${archive.id}/page?path=$encodedPath"
 
-                AsyncImage(
-                    model = imageRequest,
-                    contentDescription = "第 $currentPage 页",
+                SubcomposeAsyncImage(
+                    model = ImageRequest.Builder(context).data(imgUrl).crossfade(true).build(),
+                    imageLoader = imageLoader,
+                    contentDescription = "第 ${currentIndex + 1} 页",
                     modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Fit
+                    contentScale = ContentScale.Fit,
+                    loading = {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                        }
+                    },
+                    error = {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("图片加载失败，请检查网络", color = Color.White)
+                        }
+                    }
                 )
             }
         }
