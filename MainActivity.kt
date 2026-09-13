@@ -33,7 +33,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
@@ -51,7 +50,7 @@ class MainActivity : ComponentActivity() {
 
 data class ArchiveItem(val id: String, val title: String, val pageCount: Int, var progress: Int = 0)
 
-// 全局带 CookieJar 的 OkHttpClient，行为与浏览器网络栈完全一致
+// 全局 Cookie 管理器：完全模拟浏览器的 Session 会话行为
 class CookieManager {
     private val cookieStore = mutableMapOf<String, MutableList<Cookie>>()
 
@@ -80,8 +79,10 @@ fun AppRoot() {
     val context = LocalContext.current
     val sharedPref = remember { context.getSharedPreferences("ichaival_prefs", Context.MODE_PRIVATE) }
 
+    // 读取本地保存的地址和密码
     var serverUrl by remember { mutableStateOf(sharedPref.getString("url", "http://192.168.1.100:3000") ?: "") }
     var passwordInput by remember { mutableStateOf(sharedPref.getString("pwd", "") ?: "") }
+    
     var archives by remember { mutableStateOf<List<ArchiveItem>>(emptyList()) }
     var currentArchive by remember { mutableStateOf<ArchiveItem?>(null) }
     var showSettings by remember { mutableStateOf(false) }
@@ -89,14 +90,14 @@ fun AppRoot() {
     val scope = rememberCoroutineScope()
     val client = globalCookieManager.client
 
-    // 配置专属于此 OkHttpClient 的图片加载器
+    // Coil 图片加载器绑定全局的 OkHttpClient（让图片请求自动带上 Cookie）
     val imageLoader = remember {
         ImageLoader.Builder(context)
             .okHttpClient(client)
             .build()
     }
 
-    // 网页端进度上报接口
+    // 核心功能 1：网页端进度上报接口
     fun syncProgress(archiveId: String, page: Int) {
         scope.launch(Dispatchers.IO) {
             try {
@@ -110,13 +111,13 @@ fun AppRoot() {
         }
     }
 
-    // 像网页一样先走表单登录获取 Session Cookie，随后拉取画廊列表
+    // 核心功能 2：表单密码登录与书架拉取
     fun loginAndLoad() {
         scope.launch(Dispatchers.IO) {
             try {
                 val cleanUrl = serverUrl.trimEnd('/')
                 
-                // 1. 如果填了密码，先向 /login 发起表单登录
+                // 1. 模拟网页端：向 /login 发起表单登录，获取 Cookie
                 if (passwordInput.isNotBlank()) {
                     val formBody = FormBody.Builder()
                         .add("password", passwordInput.trim())
@@ -128,7 +129,7 @@ fun AppRoot() {
                     client.newCall(loginReq).execute().close()
                 }
 
-                // 2. 带上 Cookie 请求归档列表
+                // 2. 携带刚刚获取的 Cookie 访问 API 拉取档案列表
                 val req = Request.Builder().url("$cleanUrl/api/archives").get().build()
                 val resp = client.newCall(req).execute()
                 val body = resp.body?.string() ?: ""
@@ -140,16 +141,18 @@ fun AppRoot() {
                     return@launch
                 }
 
+                // 拦截服务端返回的 JSON 报错（如未登录或密码错误）
                 if (body.startsWith("{")) {
                     val jsonObj = JSONObject(body)
                     if (jsonObj.has("error")) {
                         withContext(Dispatchers.Main) {
-                            errorMessage = "认证失败: ${jsonObj.getString("error")}"
+                            errorMessage = "密码错误或未登录: ${jsonObj.getString("error")}"
                         }
                         return@launch
                     }
                 }
 
+                // 解析书架数据
                 val jsonArray = JSONArray(body)
                 val list = mutableListOf<ArchiveItem>()
                 for (i in 0 until jsonArray.length()) {
@@ -167,7 +170,7 @@ fun AppRoot() {
                 withContext(Dispatchers.Main) {
                     archives = list
                     errorMessage = null
-                    // 保存配置
+                    // 登录成功后保存配置到本地
                     sharedPref.edit().putString("url", serverUrl).putString("pwd", passwordInput).apply()
                 }
             } catch (e: Exception) {
@@ -178,15 +181,21 @@ fun AppRoot() {
         }
     }
 
+    // 初始化时自动尝试加载
+    LaunchedEffect(Unit) {
+        if (serverUrl.isNotBlank()) {
+            loginAndLoad()
+        }
+    }
+
     if (currentArchive != null) {
         ReaderScreen(
             serverUrl = serverUrl,
             archive = currentArchive!!,
-            client = client,
             imageLoader = imageLoader,
             onProgressChange = { p ->
                 currentArchive?.progress = p
-                syncProgress(currentArchive!!.id, p)
+                syncProgress(currentArchive!!.id, p) // 实时调用打卡接口
             },
             onBack = { currentArchive = null }
         )
@@ -221,9 +230,9 @@ fun AppRoot() {
                         modifier = Modifier.align(Alignment.Center),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Text("尚未获取到书架内容")
+                        Text("点击右上角设置图标，输入网页版密码登录")
                         Spacer(modifier = Modifier.height(8.dp))
-                        Button(onClick = { showSettings = true }) { Text("配置连接") }
+                        Button(onClick = { showSettings = true }) { Text("配置登录") }
                     }
                 } else {
                     LazyVerticalGrid(
@@ -273,13 +282,13 @@ fun AppRoot() {
         if (showSettings) {
             AlertDialog(
                 onDismissRequest = { showSettings = false },
-                title = { Text("LANraragi 网页登录设置") },
+                title = { Text("LANraragi 网页版登录") },
                 text = {
                     Column {
                         OutlinedTextField(
                             value = serverUrl,
                             onValueChange = { serverUrl = it },
-                            label = { Text("服务器地址 (含端口)") },
+                            label = { Text("服务器完整地址 (含端口)") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -287,8 +296,8 @@ fun AppRoot() {
                         OutlinedTextField(
                             value = passwordInput,
                             onValueChange = { passwordInput = it },
-                            label = { Text("网页端密码") },
-                            placeholder = { Text("例如 114514") },
+                            label = { Text("后台登录密码") },
+                            placeholder = { Text("114514") },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -298,7 +307,7 @@ fun AppRoot() {
                     Button(onClick = {
                         showSettings = false
                         loginAndLoad()
-                    }) { Text("像网页端一样登录") }
+                    }) { Text("保存并登录") }
                 },
                 dismissButton = {
                     TextButton(onClick = { showSettings = false }) { Text("取消") }
@@ -313,58 +322,18 @@ fun AppRoot() {
 fun ReaderScreen(
     serverUrl: String,
     archive: ArchiveItem,
-    client: OkHttpClient,
     imageLoader: ImageLoader,
     onProgressChange: (Int) -> Unit,
     onBack: () -> Unit
 ) {
     val context = LocalContext.current
-    var pages by remember { mutableStateOf<List<String>>(emptyList()) }
-    var currentIndex by remember { mutableStateOf(if (archive.progress > 0) (archive.progress - 1).coerceAtLeast(0) else 0) }
-    var isLoadingFiles by remember { mutableStateOf(true) }
-    var loadError by remember { mutableStateOf<String?>(null) }
+    var currentPage by remember { mutableStateOf(if (archive.progress > 0) archive.progress else 1) }
     val cleanUrl = serverUrl.trimEnd('/')
-
-    // 复刻网页端 reader.js：进入阅读器先通过 /api/archives/{id}/files 获取实际图片路径数组
-    LaunchedEffect(archive.id) {
-        withContext(Dispatchers.IO) {
-            try {
-                val req = Request.Builder().url("$cleanUrl/api/archives/${archive.id}/files").get().build()
-                val resp = client.newCall(req).execute()
-                val body = resp.body?.string() ?: ""
-
-                if (resp.isSuccessful) {
-                    val jsonObj = JSONObject(body)
-                    val pagesJson = jsonObj.getJSONArray("pages")
-                    val pageList = mutableListOf<String>()
-                    for (i in 0 until pagesJson.length()) {
-                        pageList.add(pagesJson.getString(i))
-                    }
-                    withContext(Dispatchers.Main) {
-                        pages = pageList
-                        isLoadingFiles = false
-                    }
-                } else {
-                    withContext(Dispatchers.Main) {
-                        loadError = "获取页面清单失败 (${resp.code})"
-                        isLoadingFiles = false
-                    }
-                }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    loadError = "加载异常: ${e.localizedMessage}"
-                    isLoadingFiles = false
-                }
-            }
-        }
-    }
-
-    val totalCount = if (pages.isNotEmpty()) pages.size else archive.pageCount
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("${archive.title} (${currentIndex + 1}/$totalCount)") },
+                title = { Text("${archive.title} ($currentPage/${archive.pageCount})") },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回")
@@ -380,20 +349,20 @@ fun ReaderScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Button(
-                        enabled = currentIndex > 0 && !isLoadingFiles,
+                        enabled = currentPage > 1,
                         onClick = {
-                            currentIndex--
-                            onProgressChange(currentIndex + 1)
+                            currentPage--
+                            onProgressChange(currentPage)
                         }
                     ) { Text("上一页") }
 
-                    Text("${currentIndex + 1} / $totalCount")
+                    Text("$currentPage / ${archive.pageCount}")
 
                     Button(
-                        enabled = currentIndex < totalCount - 1 && !isLoadingFiles,
+                        enabled = currentPage < archive.pageCount,
                         onClick = {
-                            currentIndex++
-                            onProgressChange(currentIndex + 1)
+                            currentPage++
+                            onProgressChange(currentPage)
                         }
                     ) { Text("下一页") }
                 }
@@ -407,38 +376,32 @@ fun ReaderScreen(
                 .background(Color.Black),
             contentAlignment = Alignment.Center
         ) {
-            if (isLoadingFiles) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text("正在载入漫画页面清单...", color = Color.White)
-                }
-            } else if (loadError != null) {
-                Text(text = loadError!!, color = MaterialTheme.colorScheme.error)
-            } else if (pages.isNotEmpty()) {
-                // 使用解压后的真实相对路径拼接图片 URL（网页端同款机制）
-                val currentPath = pages[currentIndex]
-                val encodedPath = URLEncoder.encode(currentPath, "UTF-8")
-                val imgUrl = "$cleanUrl/api/archives/${archive.id}/page?path=$encodedPath"
+            // 直接拼接页码加载，彻底告别数百页归档文件的 404 与长时间加载卡顿
+            val pageUrl = "$cleanUrl/api/archives/${archive.id}/page?page=$currentPage"
 
-                SubcomposeAsyncImage(
-                    model = ImageRequest.Builder(context).data(imgUrl).crossfade(true).build(),
-                    imageLoader = imageLoader,
-                    contentDescription = "第 ${currentIndex + 1} 页",
-                    modifier = Modifier.fillMaxSize(),
-                    contentScale = ContentScale.Fit,
-                    loading = {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
-                        }
-                    },
-                    error = {
-                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            Text("图片加载失败，请检查网络", color = Color.White)
-                        }
+            SubcomposeAsyncImage(
+                model = ImageRequest.Builder(context)
+                    .data(pageUrl)
+                    .crossfade(true)
+                    .build(),
+                imageLoader = imageLoader,
+                contentDescription = "第 $currentPage 页",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Fit,
+                loading = {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
                     }
-                )
-            }
+                },
+                error = {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(
+                            text = "图片加载失败 (第 $currentPage 页)\n点击上一页/下一页重试",
+                            color = Color.White
+                        )
+                    }
+                }
+            )
         }
     }
 }
